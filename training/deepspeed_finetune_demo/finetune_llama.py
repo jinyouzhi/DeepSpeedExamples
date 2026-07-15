@@ -347,6 +347,8 @@ def main(args):
 
     train_sampler = DistributedSampler(
         tokenized_train_dataset,
+        num_replicas=model_engine.mpu.get_data_parallel_world_size(),
+        rank=model_engine.mpu.get_data_parallel_rank(),
         shuffle=True,
         seed=args.seed,
     )
