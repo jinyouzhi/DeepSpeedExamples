@@ -156,6 +156,42 @@ maximum and mean absolute loss differences from the uninterrupted baseline. A
 successful run means both resume paths produced comparable losses; inspect the
 logs and differences when diagnosing a mismatch.
 
+## Profile AutoEP weight transfers
+
+`autoep_transfer_profile.py` builds a truncated MoE model (2 layers by default) with
+AutoEP, trains it for a few steps, and then moves its live weights into new layouts
+with the AffineIR transfer planner and executor:
+
+- `permute`: the same EP size with experts dealt to different ranks;
+- `ep8`: a different EP size;
+- `redundant`: EP8 plus the first four experts copied to every rank (EPLB style);
+- `dense_tp4`: a dense parameter split by rows across four ranks.
+
+Sources come from the engine's storage maps, so EDP replicas (ZeRO-0/1/2) and ZeRO-3
+fragments are read in place. Targets start filled with NaN, and every element is
+compared bitwise against a reference gathered with plain collectives. The script also
+compares several example replica selectors (`first`, `round_robin`, `local_first`,
+`balanced`). They show how the choice of source replica changes the plan; they are not
+DeepSpeed policies.
+
+The script needs a DeepSpeed build with the AffineIR transfer planner, executor, and
+AutoEP storage maps. Only the model config is loaded, so no weights are downloaded:
+
+```bash
+cd training/deepspeed_finetune_demo
+MODEL_NAME=/path/to/Qwen3-30B-A3B ./run_autoep_transfer_profile.sh
+```
+
+`NUM_GPUS`, `AUTOEP_SIZE`, `NUM_LAYERS`, `ZERO_STAGES` (default `"2 3"`), and
+`OUTPUT_ROOT` override the defaults. Each stage writes `zero<stage>.json` with a manifest
+(software versions and devices), one entry per scenario and selector, and, for stage 2,
+a `calibration` block. Each entry holds the plan analysis (bytes, segments, per-rank and
+rank-pair traffic, predicted chunks and rounds, potential metrics), the executor's
+counts, `stats_match` (the analysis predicted the executor's counts exactly), the
+bitwise result, peak memory, plan build time, and execution times. The calibration
+block holds measured point-to-point and local-copy times by message size, plus a
+latency/bandwidth fit for each path. The script exits with an error if any check fails.
+
 ## HumanEval results
 
 | Model | HumanEval (base) | HumanEval+ |
