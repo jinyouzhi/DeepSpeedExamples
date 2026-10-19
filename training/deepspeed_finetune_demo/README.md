@@ -186,11 +186,13 @@ MODEL_NAME=/path/to/Qwen3-30B-A3B ./run_autoep_transfer_profile.sh
 `OUTPUT_ROOT` override the defaults. Each stage writes `zero<stage>.json` with a manifest
 (software versions and devices), one entry per scenario and selector, and, for stage 2,
 a `calibration` block. Each entry holds the plan analysis (bytes, segments, per-rank and
-rank-pair traffic, predicted chunks and rounds, potential metrics), the executor's
-counts, `stats_match` (the analysis predicted the executor's counts exactly), the
-bitwise result, peak memory, plan build time, and execution times. The calibration
-block holds measured point-to-point and local-copy times by message size, plus a
-latency/bandwidth fit for each path. The script exits with an error if any check fails.
+rank-pair traffic, the executor's per-round messages, every replica candidate offered
+and the one chosen), the executor's counts, `stats_match` (the analysis predicted the
+executor's counts exactly), the bitwise result, peak memory, plan build time, and
+execution times for every rank and repeat. The calibration block holds raw
+point-to-point and local-copy times for every message size and repeat. The output is
+input for a cost model: the script fits no model, estimates no time, and ranks no plan.
+The script exits with an error if any check fails.
 
 ## HumanEval results
 

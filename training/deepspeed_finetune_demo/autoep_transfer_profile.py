@@ -9,7 +9,8 @@ planner and executor, and every target element is checked bit for bit against a 
 gathered with plain collectives, independent of the affine code.
 
 Each run records the plan analysis, the executor's own counts, and measured time and memory.
-Replica selectors here are examples used to compare plans; they are not DeepSpeed policy.
+Replica selectors here are examples used to compare plans; they are not DeepSpeed policy. The
+output is raw input for a cost model: nothing here fits a model, estimates time, or ranks plans.
 """
 
 import argparse
@@ -29,8 +30,8 @@ import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
 from deepspeed.checkpoint.affine_transfer import PlanBudget, plan_transfer
 from deepspeed.checkpoint.affine_transfer_analysis import (LOCAL, PEER, ReplicaRecorder, analyze_transfers,
-                                                           distribution, estimate_seconds, expected_stats,
-                                                           fit_path_cost, replica_report, report_to_dict)
+                                                           distribution, expected_stats, replica_report,
+                                                           report_to_dict)
 from deepspeed.checkpoint.affine_transfer_executor import (StagingBudget, TransferEndpoints, TransferRequest,
                                                            execute_transfers, plan_digest)
 from deepspeed.checkpoint.autoep_affine import autoep_storage_affine_map, make_autoep_placement_descriptor
@@ -54,7 +55,7 @@ def parse_args():
     parser.add_argument("--budget_mb", type=float, default=8.0, help="executor staging bytes per peer")
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
-    parser.add_argument("--calibrate", action="store_true", help="measure p2p and local copy costs")
+    parser.add_argument("--calibrate", action="store_true", help="record raw p2p and local copy times by size")
     parser.add_argument("--output", default="autoep_transfer_profile.json")
     parser.add_argument("--local_rank", type=int, default=-1)
     return parser.parse_args()
@@ -374,18 +375,25 @@ def check_bitwise(items, target_buffers):
     return mismatched, unwritten, checked
 
 
+def all_ranks(value):
+    values = [None] * dist.get_world_size()
+    dist.all_gather_object(values, value)
+    return values
+
+
 def time_execute(requests, endpoints, budget):
+    """Run one batch; return the executor's stats and every rank's elapsed seconds."""
     dist.barrier()
     synchronize()
     started = time.perf_counter()
     stats = execute_transfers(requests, endpoints, DTYPE, budget)
     synchronize()
     elapsed = time.perf_counter() - started
-    return stats, max_over_ranks(elapsed)
+    return stats, all_ranks(elapsed)
 
 
 # ---------------------------------------------------------------------------
-# Calibration: measured per-path costs, fitted for the analyzer's model check
+# Calibration: raw per-path times by message size, for an external cost model
 # ---------------------------------------------------------------------------
 
 
@@ -419,12 +427,11 @@ def calibrate(device, repeats=10):
             if repeat >= 2:
                 peer_times.append(peer)
                 local_times.append(local)
-        samples[PEER].append((size, sorted(peer_times)[len(peer_times) // 2]))
-        samples[LOCAL].append((size, sorted(local_times)[len(local_times) // 2]))
-    costs = {}
-    for path, points in samples.items():
-        costs[path] = fit_path_cost([size for size, _ in points], [seconds for _, seconds in points])
-    return costs, {path: [{"bytes": size, "seconds": seconds} for size, seconds in points] for path, points in samples.items()}
+        samples[PEER].append({"bytes": size, "from_process": 0, "to_process": 1, "seconds": peer_times})
+        samples[LOCAL].append({"bytes": size, "process": rank, "seconds": local_times})
+    # Every rank measured its own local copies; keep them all.
+    samples[LOCAL] = [entry for entries in all_ranks(samples[LOCAL]) for entry in entries]
+    return samples
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +460,7 @@ def manifest(args, world):
     }
 
 
-def run_scenario(engine, scenario, policies, args, costs, device):
+def run_scenario(engine, scenario, policies, args, device):
     world = dist.get_world_size()
     rank = dist.get_rank()
     items = dense_items(engine, scenario, world) if scenario.startswith("dense") else expert_items(
@@ -480,6 +487,7 @@ def run_scenario(engine, scenario, policies, args, costs, device):
         get_accelerator().reset_peak_memory_stats()
         memory_before = get_accelerator().memory_allocated()
         stats, first_seconds = time_execute(requests_for(items, plans, targets), endpoints, budget)
+        first_seconds = max(first_seconds)
         peak_extra = max_over_ranks(get_accelerator().max_memory_allocated() - memory_before)
         stats_match = asdict(stats) == expected_stats(report, rank)
         mismatched, unwritten, checked = check_bitwise(items, targets)
@@ -500,8 +508,9 @@ def run_scenario(engine, scenario, policies, args, costs, device):
                     "unwritten_elements": int(sum_over_ranks(unwritten)),
                     "checked_elements": int(sum_over_ranks(checked)),
                 },
-                "analysis": report_to_dict(report, replicas, costs),
+                "analysis": report_to_dict(report, replicas, include_messages=True),
                 "execute_seconds": [],
+                "execute_seconds_by_rank": [],
             },
             "remote_bytes": report.remote_bytes,
         })
@@ -511,7 +520,8 @@ def run_scenario(engine, scenario, policies, args, costs, device):
         for run in runs:
             _, seconds = time_execute(requests_for(items, run["plans"], run["targets"]), endpoints, budget)
             if repeat >= args.warmup:
-                run["record"]["execute_seconds"].append(seconds)
+                run["record"]["execute_seconds"].append(max(seconds))
+                run["record"]["execute_seconds_by_rank"].append(seconds)
 
     records = []
     for run in runs:
@@ -534,19 +544,13 @@ def main():
     engine, _ = build_engine(args)
     output = {"manifest": manifest(args, world)}
 
-    costs = None
     if args.calibrate:
-        costs, points = calibrate(device)
-        output["calibration"] = {
-            "points": points,
-            "fit": {path: asdict(cost)
-                    for path, cost in costs.items()},
-        }
+        output["calibration"] = calibrate(device)
 
     output["runs"] = []
     policies = args.policies.split(",")
     for scenario in args.scenarios.split(","):
-        records = run_scenario(engine, scenario, policies, args, costs, device)
+        records = run_scenario(engine, scenario, policies, args, device)
         output["runs"].extend(records)
         if dist.get_rank() == 0:
             for record in records:
