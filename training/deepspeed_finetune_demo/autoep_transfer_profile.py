@@ -40,6 +40,7 @@ from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer
 
 EXPERT_PARAMS = ("w1", "w2", "w3")
 DTYPE = torch.bfloat16
+CONCURRENT = "concurrent"
 
 
 def parse_args():
@@ -55,7 +56,7 @@ def parse_args():
     parser.add_argument("--budget_mb", type=float, default=8.0, help="executor staging bytes per peer")
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
-    parser.add_argument("--calibrate", action="store_true", help="record raw p2p and local copy times by size")
+    parser.add_argument("--calibrate", action="store_true", help="record raw link and local copy times by size")
     parser.add_argument("--output", default="autoep_transfer_profile.json")
     parser.add_argument("--local_rank", type=int, default=-1)
     return parser.parse_args()
@@ -397,40 +398,98 @@ def time_execute(requests, endpoints, budget):
 # ---------------------------------------------------------------------------
 
 
-def calibrate(device, repeats=10):
+def exchange(send, recv, to_process, from_process):
+    """Post one send and one receive in a single group call; either side may be None."""
+    ops = []
+    # Sends are posted before receives: oneCCL hangs on a group call that starts with a receive.
+    if to_process is not None:
+        ops.append(dist.P2POp(dist.isend, send, to_process))
+    if from_process is not None:
+        ops.append(dist.P2POp(dist.irecv, recv, from_process))
+    if ops:
+        for handle in dist.batch_isend_irecv(ops):
+            handle.wait()
+
+
+def timed_exchange(send, recv, to_process, from_process):
+    dist.barrier()
+    synchronize()
+    started = time.perf_counter()
+    exchange(send, recv, to_process, from_process)
+    synchronize()
+    return time.perf_counter() - started
+
+
+def calibrate(device, repeats=10, warmup=2):
+    """Record raw link times by message size, with no fit.
+
+    - peer: every ordered rank pair alone, so that links through different switches and
+      sockets are all sampled; the time of a sample is the slower of its two endpoints.
+    - concurrent: every rank sends to rank + shift and receives from rank - shift at once,
+      for every shift, so that links are sampled while they share switches and root ports.
+    - local: a device-local copy on every rank.
+    """
     rank = dist.get_rank()
+    world = dist.get_world_size()
     sizes = [1 << shift for shift in range(12, 27, 2)]
-    samples = {PEER: [], LOCAL: []}
+    peer_times = {}
+    concurrent_times = {}
+    local_times = {}
     for size in sizes:
         numel = size // 2
         send = torch.ones(numel, dtype=DTYPE, device=device)
         recv = torch.empty(numel, dtype=DTYPE, device=device)
-        peer_times, local_times = [], []
-        for repeat in range(repeats + 2):
-            dist.barrier()
-            synchronize()
-            started = time.perf_counter()
-            # Sends are posted before receives: oneCCL hangs on a group call that starts with a receive.
-            if rank == 0:
-                for handle in dist.batch_isend_irecv([dist.P2POp(dist.isend, send, 1)]):
-                    handle.wait()
-            elif rank == 1:
-                for handle in dist.batch_isend_irecv([dist.P2POp(dist.irecv, recv, 0)]):
-                    handle.wait()
-            synchronize()
-            peer = max_over_ranks(time.perf_counter() - started if rank in (0, 1) else 0.0)
+        for source in range(world):
+            for target in range(world):
+                if source == target:
+                    continue
+                times = []
+                for repeat in range(warmup + repeats):
+                    to_process = target if rank == source else None
+                    from_process = source if rank == target else None
+                    seconds = timed_exchange(send, recv, to_process, from_process)
+                    if repeat >= warmup and rank in (source, target):
+                        times.append(seconds)
+                if times:
+                    peer_times[(size, source, target)] = times
+        for shift in range(1, world):
+            times = []
+            for repeat in range(warmup + repeats):
+                seconds = timed_exchange(send, recv, (rank + shift) % world, (rank - shift) % world)
+                if repeat >= warmup:
+                    times.append(seconds)
+            concurrent_times[(size, shift)] = times
+        times = []
+        for repeat in range(warmup + repeats):
             synchronize()
             started = time.perf_counter()
             recv.copy_(send)
             synchronize()
-            local = time.perf_counter() - started
-            if repeat >= 2:
-                peer_times.append(peer)
-                local_times.append(local)
-        samples[PEER].append({"bytes": size, "from_process": 0, "to_process": 1, "seconds": peer_times})
-        samples[LOCAL].append({"bytes": size, "process": rank, "seconds": local_times})
-    # Every rank measured its own local copies; keep them all.
-    samples[LOCAL] = [entry for entries in all_ranks(samples[LOCAL]) for entry in entries]
+            if repeat >= warmup:
+                times.append(time.perf_counter() - started)
+        local_times[size] = times
+
+    # Timings stay rank-local until here so that no collective runs inside a timed region.
+    gathered = all_ranks((peer_times, concurrent_times, local_times))
+    samples = {PEER: [], CONCURRENT: [], LOCAL: []}
+    for size in sizes:
+        for source in range(world):
+            for target in range(world):
+                if source == target:
+                    continue
+                source_times = gathered[source][0][(size, source, target)]
+                target_times = gathered[target][0][(size, source, target)]
+                samples[PEER].append({
+                    "bytes": size,
+                    "from_process": source,
+                    "to_process": target,
+                    "seconds": [max(pair) for pair in zip(source_times, target_times)],
+                })
+        for shift in range(1, world):
+            seconds_by_process = [gathered[process][1][(size, shift)] for process in range(world)]
+            samples[CONCURRENT].append({"bytes": size, "shift": shift, "seconds_by_process": seconds_by_process})
+        for process in range(world):
+            samples[LOCAL].append({"bytes": size, "process": process, "seconds": gathered[process][2][size]})
     return samples
 
 

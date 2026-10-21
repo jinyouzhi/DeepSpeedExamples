@@ -189,8 +189,11 @@ a `calibration` block. Each entry holds the plan analysis (bytes, segments, per-
 rank-pair traffic, the executor's per-round messages, every replica candidate offered
 and the one chosen), the executor's counts, `stats_match` (the analysis predicted the
 executor's counts exactly), the bitwise result, peak memory, plan build time, and
-execution times for every rank and repeat. The calibration block holds raw
-point-to-point and local-copy times for every message size and repeat. The output is
+execution times for every rank and repeat. The calibration block holds raw times for
+every message size and repeat: `peer` for every ordered rank pair measured alone,
+`concurrent` for every shift where all ranks send to `rank + shift` at once (so links
+are sampled while they share switches), and `local` for a device-local copy on every
+rank. The output is
 input for a cost model: the script fits no model, estimates no time, and ranks no plan.
 The script exits with an error if any check fails.
 
