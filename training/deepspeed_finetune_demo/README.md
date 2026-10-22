@@ -164,8 +164,7 @@ with the AffineIR transfer planner and executor:
 
 - `permute`: the same EP size with experts dealt to different ranks;
 - `ep8`: a different EP size;
-- `redundant`: EP8 plus the first four experts copied to every rank (EPLB style);
-- `dense_tp4`: a dense parameter split by rows across four ranks.
+- `redundant`: EP8 plus the first four experts copied to every rank (EPLB style).
 
 Sources come from the engine's storage maps, so EDP replicas (ZeRO-0/1/2) and ZeRO-3
 fragments are read in place. Targets start filled with NaN, and every element is
@@ -183,19 +182,16 @@ MODEL_NAME=/path/to/Qwen3-30B-A3B ./run_autoep_transfer_profile.sh
 ```
 
 `NUM_GPUS`, `AUTOEP_SIZE`, `NUM_LAYERS`, `ZERO_STAGES` (default `"2 3"`), and
-`OUTPUT_ROOT` override the defaults. Each stage writes `zero<stage>.json` with a manifest
-(software versions and devices), one entry per scenario and selector, and, for stage 2,
-a `calibration` block. Each entry holds the plan analysis (bytes, segments, per-rank and
-rank-pair traffic, the executor's per-round messages, every replica candidate offered
-and the one chosen), the executor's counts, `stats_match` (the analysis predicted the
-executor's counts exactly), the bitwise result, peak memory, plan build time, and
-execution times for every rank and repeat. The calibration block holds raw times for
-every message size and repeat: `peer` for every ordered rank pair measured alone,
-`concurrent` for every shift where all ranks send to `rank + shift` at once (so links
-are sampled while they share switches), and `local` for a device-local copy on every
-rank. The output is
-input for a cost model: the script fits no model, estimates no time, and ranks no plan.
-The script exits with an error if any check fails.
+`OUTPUT_ROOT` override the defaults. Each stage writes `zero<stage>.json` with a
+manifest (software versions and devices), one entry per scenario and selector, and, for
+stage 2, a `calibration` block. Each entry holds the executor's counts on every rank,
+the bitwise result, peak memory, plan build time, and execution times for every rank and
+repeat. The calibration block holds raw times for every message size and repeat: `peer`
+for every ordered rank pair measured alone, `concurrent` for every shift where all ranks
+send to `rank + shift` at once (so links are sampled while they share switches), and
+`local` for a device-local copy on every rank. The output is input for a cost model: the
+script fits no model, estimates no time, and ranks no plan. The script exits with an
+error if any check fails.
 
 ## HumanEval results
 

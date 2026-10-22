@@ -4,9 +4,9 @@
 
 set -euo pipefail
 
-# Move live AutoEP expert and ZeRO dense weights into new layouts with the AffineIR
-# planner and executor, check every target element bitwise, and record plan metrics,
-# timings and raw link timings as JSON.
+# Move live AutoEP expert weights into new layouts with the AffineIR planner and
+# executor, check every target element bitwise, and record executor counts, timings
+# and raw link timings as JSON.
 #
 # Override MODEL_NAME, NUM_GPUS, AUTOEP_SIZE, ZERO_STAGES, and OUTPUT_ROOT as needed.
 

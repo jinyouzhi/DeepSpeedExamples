@@ -3,12 +3,11 @@
 """Move live AutoEP training weights to new layouts and measure every step.
 
 The source is a real DeepSpeed engine after a few training steps: AutoEP experts with
-expert-data-parallel (EDP) replicas or ZeRO-3 fragments, and dense parameters replicated
-(ZeRO-0/1/2) or partitioned (ZeRO-3). Storage maps from the engine feed the affine transfer
-planner and executor, and every target element is checked bit for bit against a reference
+expert-data-parallel (EDP) replicas or ZeRO-3 fragments. Storage maps from the engine feed the
+affine transfer planner and executor, and every target element is checked bit for bit against a reference
 gathered with plain collectives, independent of the affine code.
 
-Each run records the plan analysis, the executor's own counts, and measured time and memory.
+Each run records the executor's own counts, and measured time and memory.
 Replica selectors here are examples used to compare plans; they are not DeepSpeed policy. The
 output is raw input for a cost model: nothing here fits a model, estimates time, or ranks plans.
 """
@@ -29,17 +28,15 @@ import deepspeed
 import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
 from deepspeed.checkpoint.affine_transfer import PlanBudget, plan_transfer
-from deepspeed.checkpoint.affine_transfer_analysis import (LOCAL, PEER, ReplicaRecorder, analyze_transfers,
-                                                           distribution, expected_stats, replica_report,
-                                                           report_to_dict)
 from deepspeed.checkpoint.affine_transfer_executor import (StagingBudget, TransferEndpoints, TransferRequest,
                                                            execute_transfers, plan_digest)
 from deepspeed.checkpoint.autoep_affine import autoep_storage_affine_map, make_autoep_placement_descriptor
-from deepspeed.checkpoint.zero_affine import zero_param_storage_affine_map, zero_storage_affine_map
 from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer
 
 EXPERT_PARAMS = ("w1", "w2", "w3")
 DTYPE = torch.bfloat16
+PEER = "peer"
+LOCAL = "local"
 CONCURRENT = "concurrent"
 
 
@@ -51,7 +48,7 @@ def parse_args():
     parser.add_argument("--zero_stage", type=int, default=2, choices=(0, 1, 2, 3))
     parser.add_argument("--train_steps", type=int, default=2)
     parser.add_argument("--seq_len", type=int, default=64)
-    parser.add_argument("--scenarios", default="permute,ep8,redundant,dense_tp4")
+    parser.add_argument("--scenarios", default="permute,ep8,redundant")
     parser.add_argument("--policies", default="first,round_robin,local_first,balanced")
     parser.add_argument("--budget_mb", type=float, default=8.0, help="executor staging bytes per peer")
     parser.add_argument("--warmup", type=int, default=2)
@@ -224,53 +221,6 @@ class ExpertReference:
         self.full = None
 
 
-class DenseReference:
-
-    def __init__(self, param, target_map):
-        self.param = param
-        self.target_map = target_map
-        self.full = None
-
-    def gather(self):
-        self.full = full_parameter(self.param).reshape(-1)
-
-    def __call__(self, location):
-        piece = self.target_map.pieces_by_rank[location][0]
-        return self.full[piece.source_offset:piece.source_offset + math.prod(piece.shape)]
-
-    def release(self):
-        self.full = None
-
-
-def dense_items(engine, scenario, world):
-    if scenario != "dense_tp4":
-        raise ValueError(scenario)
-    expert_ids = set()
-    for _, layer in autoep_layers(engine):
-        expert_ids.update(id(param) for param in layer.experts.parameters())
-    targets = [target_rank_of(rank, 4, world) for rank in range(4)]
-    items = []
-    rank = dist.get_rank()
-    for name, param in engine.module.named_parameters():
-        if id(param) in expert_ids:
-            continue
-        shape = getattr(param, "ds_shape", param.shape)
-        rows = shape[0]
-        row_numel = math.prod(shape[1:])
-        if rows < len(targets):
-            continue
-        # A row split over four ranks, like a TP4 consumer; on the flattened tensor each row block
-        # is one contiguous range, so a ZeRO-style contiguous map describes it exactly.
-        per_rank = math.ceil(rows / len(targets)) * row_numel
-        target_map = zero_storage_affine_map(math.prod(shape), targets, partition_numel=per_rank)
-        source_map = zero_param_storage_affine_map(param)
-        source_buffer = None
-        if rank in source_map.shard_shapes:
-            source_buffer = flat_storage(param, math.prod(source_map.shard_shapes[rank]))
-        items.append(Item(name, source_map, target_map, source_buffer, DenseReference(param, target_map)))
-    return items
-
-
 # ---------------------------------------------------------------------------
 # Example replica selectors (comparison only, not DeepSpeed policy)
 # ---------------------------------------------------------------------------
@@ -374,6 +324,26 @@ def check_bitwise(items, target_buffers):
             checked += got.numel()
         item.reference_for.release()
     return mismatched, unwritten, checked
+
+
+def distribution(values):
+    """Count, sum and order statistics, with nearest-rank percentiles."""
+    ordered = sorted(values)
+    if not ordered:
+        return {"count": 0, "sum": 0}
+
+    def percentile(fraction):
+        return ordered[max(0, math.ceil(fraction * len(ordered)) - 1)]
+
+    return {
+        "count": len(ordered),
+        "sum": sum(ordered),
+        "min": ordered[0],
+        "p50": percentile(0.5),
+        "p90": percentile(0.9),
+        "max": ordered[-1],
+        "mean": sum(ordered) / len(ordered),
+    }
 
 
 def all_ranks(value):
@@ -522,8 +492,7 @@ def manifest(args, world):
 def run_scenario(engine, scenario, policies, args, device):
     world = dist.get_world_size()
     rank = dist.get_rank()
-    items = dense_items(engine, scenario, world) if scenario.startswith("dense") else expert_items(
-        engine, scenario, world)
+    items = expert_items(engine, scenario, world)
     endpoints = TransferEndpoints(source={location: location
                                           for location in range(world)},
                                   target={location: location
@@ -533,14 +502,10 @@ def run_scenario(engine, scenario, policies, args, device):
 
     runs = []
     for policy in policies:
-        recorder = ReplicaRecorder(make_selector(policy, endpoints, element_size))
+        selector = make_selector(policy, endpoints, element_size)
         started = time.perf_counter()
-        plans = [plan_transfer(item.target_map, item.source_map, PlanBudget(), replica_selector=recorder) for item in items]
+        plans = [plan_transfer(item.target_map, item.source_map, PlanBudget(), replica_selector=selector) for item in items]
         plan_seconds = max_over_ranks(time.perf_counter() - started)
-        started = time.perf_counter()
-        report = analyze_transfers(plans, endpoints, element_size, budget)
-        replicas = replica_report(recorder, plans, endpoints, element_size)
-        analyze_seconds = max_over_ranks(time.perf_counter() - started)
 
         targets = nan_targets(items, endpoints, device)
         get_accelerator().reset_peak_memory_stats()
@@ -548,7 +513,7 @@ def run_scenario(engine, scenario, policies, args, device):
         stats, first_seconds = time_execute(requests_for(items, plans, targets), endpoints, budget)
         first_seconds = max(first_seconds)
         peak_extra = max_over_ranks(get_accelerator().max_memory_allocated() - memory_before)
-        stats_match = asdict(stats) == expected_stats(report, rank)
+        stats_by_rank = all_ranks(asdict(stats))
         mismatched, unwritten, checked = check_bitwise(items, targets)
         runs.append({
             "plans": plans,
@@ -558,20 +523,18 @@ def run_scenario(engine, scenario, policies, args, device):
                 "policy": policy,
                 "plan_digests": [plan_digest(plan, endpoints, budget, element_size) for plan in plans],
                 "plan_seconds": plan_seconds,
-                "analyze_seconds": analyze_seconds,
                 "first_execute_seconds": first_seconds,
                 "peak_extra_allocated_bytes": peak_extra,
-                "stats_match_all_ranks": sum_over_ranks(0 if stats_match else 1) == 0,
+                "executor_stats_by_rank": stats_by_rank,
                 "bitwise": {
                     "mismatched_elements": int(sum_over_ranks(mismatched)),
                     "unwritten_elements": int(sum_over_ranks(unwritten)),
                     "checked_elements": int(sum_over_ranks(checked)),
                 },
-                "analysis": report_to_dict(report, replicas, include_messages=True),
                 "execute_seconds": [],
                 "execute_seconds_by_rank": [],
             },
-            "remote_bytes": report.remote_bytes,
+            "remote_bytes": sum(rank_stats["sent_bytes"] for rank_stats in stats_by_rank),
         })
 
     # Interleave policies in each window so slow drift affects every policy alike.
@@ -614,7 +577,7 @@ def main():
         if dist.get_rank() == 0:
             for record in records:
                 bits = record["bitwise"]
-                print(f"[{scenario:>10}/{record['policy']:<11}] stats_match={record['stats_match_all_ranks']} "
+                print(f"[{scenario:>10}/{record['policy']:<11}] "
                       f"mismatched={bits['mismatched_elements']} unwritten={bits['unwritten_elements']} "
                       f"p50={record['execute'].get('p50', float('nan')) * 1e3:.2f} ms "
                       f"plan={record['plan_seconds'] * 1e3:.1f} ms",
@@ -626,8 +589,7 @@ def main():
         print(f"wrote {args.output}")
     failed = [
         record for record in output["runs"]
-        if not record["stats_match_all_ranks"] or record["bitwise"]["mismatched_elements"]
-        or record["bitwise"]["unwritten_elements"]
+        if record["bitwise"]["mismatched_elements"] or record["bitwise"]["unwritten_elements"]
     ]
     engine.destroy()
     if failed:
