@@ -156,6 +156,81 @@ maximum and mean absolute loss differences from the uninterrupted baseline. A
 successful run means both resume paths produced comparable losses; inspect the
 logs and differences when diagnosing a mismatch.
 
+## Profile AutoEP weight transfers
+
+`autoep_transfer_profile.py` builds a truncated MoE model (2 layers by default) with
+AutoEP, trains it for a few steps, and then moves its live weights into new layouts
+with the AffineIR transfer planner and executor:
+
+- `permute`: the same EP size with experts dealt to different ranks;
+- `ep8`: a different EP size;
+- `redundant`: EP8 plus the first four experts copied to every rank (EPLB style).
+
+Sources come from the engine's storage maps, so EDP replicas (ZeRO-0/1/2) and ZeRO-3
+fragments are read in place. Targets start filled with NaN, and every element is
+compared bitwise against a reference gathered with plain collectives. The script also
+compares several example replica selectors (`first`, `round_robin`, `local_first`,
+`balanced`). They show how the choice of source replica changes the plan; they are not
+DeepSpeed policies.
+
+The script needs a DeepSpeed build with the AffineIR transfer planner, executor, and
+AutoEP storage maps. Only the model config is loaded, so no weights are downloaded:
+
+```bash
+cd training/deepspeed_finetune_demo
+MODEL_NAME=/path/to/Qwen3-30B-A3B ./run_autoep_transfer_profile.sh
+```
+
+`NUM_GPUS`, `AUTOEP_SIZE`, `NUM_LAYERS`, `ZERO_STAGES` (default `"2 3"`), and
+`OUTPUT_ROOT` override the defaults. Each stage writes `zero<stage>.json` with a
+manifest (software versions and devices), one entry per scenario and selector, and, for
+stage 2, a `calibration` block. Each entry holds the executor's counts on every rank,
+the bitwise result, peak memory, plan build time, and execution times for every rank and
+repeat. The calibration block comes from
+`deepspeed.checkpoint.affine_transfer_calibration.calibrate_links`: raw times for every
+message size and repeat, for a local copy on every rank, every ordered rank pair alone,
+and all ranks sending at once. The output is input for a cost model: the script fits no
+model, estimates no time, and ranks no plan. The script exits with an error if any check
+fails.
+
+### Example: replica selectors on 8x Intel Arc Pro B70
+
+Qwen3-30B-A3B truncated to 2 layers, AutoEP 4 with EDP 2 (8 ranks), 8 MB staging,
+2 warmup and 5 timed repeats. All 24 runs were bitwise exact. `max sent` is the most
+bytes any one rank sends, `rounds` the longest round schedule of any rank, and
+`execute` the fastest repeat of the slowest rank.
+
+| ZeRO | scenario | selector | total sent | max sent | rounds | execute |
+|---|---|---|---|---|---|---|
+| 2 | permute | first | 2016 MiB | 576 MiB | 24 | 105 ms |
+| 2 | permute | local_first | 1728 MiB | 576 MiB | 24 | 81 ms |
+| 2 | permute | round_robin | 2016 MiB | 288 MiB | 12 | 62 ms |
+| 2 | permute | balanced | 2016 MiB | 288 MiB | 12 | 60 ms |
+| 2 | ep8 | first | 2016 MiB | 576 MiB | 36 | 88 ms |
+| 2 | ep8 | local_first | 1728 MiB | 576 MiB | 36 | 86 ms |
+| 2 | ep8 | balanced | 2016 MiB | 288 MiB | 24 | 74 ms |
+| 2 | redundant | first | 2520 MiB | 792 MiB | 48 | 111 ms |
+| 2 | redundant | local_first | 2160 MiB | 720 MiB | 48 | 104 ms |
+| 2 | redundant | balanced | 2484 MiB | 504 MiB | 30 | 89 ms |
+| 3 | permute | any | 2016 MiB | 288 MiB | 12 | 58 ms |
+| 3 | ep8 | any | 1728 MiB | 288 MiB | 36 | 72 ms |
+| 3 | redundant | any | 2232 MiB | 504 MiB | 36 | 89 ms |
+
+(`round_robin` matches `balanced` for `ep8` and `redundant`.)
+
+- Under ZeRO-2 every expert has two holders. `first` always reads from the lower rank,
+  so only ranks 0-3 send. `round_robin` and `balanced` spread the reads over both
+  holders: the same total bytes, half the busiest sender, half the rounds, and up to
+  1.75x faster.
+- `local_first` copies more locally and sends less in total, but leaves the busiest
+  sender unchanged. It lands in between, by a different margin per scenario.
+- Under ZeRO-3 each element has one holder, so every selector gives the same plan. This
+  is the control.
+- Total bytes alone would rank `first` and `balanced` equal. The busiest sender and the
+  round count separate them, and the `local_first` rows show that even those do not
+  fully predict time. A cost model needs measured link costs (the calibration block) in
+  addition to these counts.
+
 ## HumanEval results
 
 | Model | HumanEval (base) | HumanEval+ |
