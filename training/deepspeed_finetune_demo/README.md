@@ -186,12 +186,50 @@ MODEL_NAME=/path/to/Qwen3-30B-A3B ./run_autoep_transfer_profile.sh
 manifest (software versions and devices), one entry per scenario and selector, and, for
 stage 2, a `calibration` block. Each entry holds the executor's counts on every rank,
 the bitwise result, peak memory, plan build time, and execution times for every rank and
-repeat. The calibration block holds raw times for every message size and repeat: `peer`
-for every ordered rank pair measured alone, `concurrent` for every shift where all ranks
-send to `rank + shift` at once (so links are sampled while they share switches), and
-`local` for a device-local copy on every rank. The output is input for a cost model: the
-script fits no model, estimates no time, and ranks no plan. The script exits with an
-error if any check fails.
+repeat. The calibration block comes from
+`deepspeed.checkpoint.affine_transfer_calibration.calibrate_links`: raw times for every
+message size and repeat, for a local copy on every rank, every ordered rank pair alone,
+and all ranks sending at once. The output is input for a cost model: the script fits no
+model, estimates no time, and ranks no plan. The script exits with an error if any check
+fails.
+
+### Example: replica selectors on 8x Intel Arc Pro B70
+
+Qwen3-30B-A3B truncated to 2 layers, AutoEP 4 with EDP 2 (8 ranks), 8 MB staging,
+2 warmup and 5 timed repeats. All 24 runs were bitwise exact. `max sent` is the most
+bytes any one rank sends, `rounds` the longest round schedule of any rank, and
+`execute` the fastest repeat of the slowest rank.
+
+| ZeRO | scenario | selector | total sent | max sent | rounds | execute |
+|---|---|---|---|---|---|---|
+| 2 | permute | first | 2016 MiB | 576 MiB | 24 | 105 ms |
+| 2 | permute | local_first | 1728 MiB | 576 MiB | 24 | 81 ms |
+| 2 | permute | round_robin | 2016 MiB | 288 MiB | 12 | 62 ms |
+| 2 | permute | balanced | 2016 MiB | 288 MiB | 12 | 60 ms |
+| 2 | ep8 | first | 2016 MiB | 576 MiB | 36 | 88 ms |
+| 2 | ep8 | local_first | 1728 MiB | 576 MiB | 36 | 86 ms |
+| 2 | ep8 | balanced | 2016 MiB | 288 MiB | 24 | 74 ms |
+| 2 | redundant | first | 2520 MiB | 792 MiB | 48 | 111 ms |
+| 2 | redundant | local_first | 2160 MiB | 720 MiB | 48 | 104 ms |
+| 2 | redundant | balanced | 2484 MiB | 504 MiB | 30 | 89 ms |
+| 3 | permute | any | 2016 MiB | 288 MiB | 12 | 58 ms |
+| 3 | ep8 | any | 1728 MiB | 288 MiB | 36 | 72 ms |
+| 3 | redundant | any | 2232 MiB | 504 MiB | 36 | 89 ms |
+
+(`round_robin` matches `balanced` for `ep8` and `redundant`.)
+
+- Under ZeRO-2 every expert has two holders. `first` always reads from the lower rank,
+  so only ranks 0-3 send. `round_robin` and `balanced` spread the reads over both
+  holders: the same total bytes, half the busiest sender, half the rounds, and up to
+  1.75x faster.
+- `local_first` copies more locally and sends less in total, but leaves the busiest
+  sender unchanged. It lands in between, by a different margin per scenario.
+- Under ZeRO-3 each element has one holder, so every selector gives the same plan. This
+  is the control.
+- Total bytes alone would rank `first` and `balanced` equal. The busiest sender and the
+  round count separate them, and the `local_first` rows show that even those do not
+  fully predict time. A cost model needs measured link costs (the calibration block) in
+  addition to these counts.
 
 ## HumanEval results
 

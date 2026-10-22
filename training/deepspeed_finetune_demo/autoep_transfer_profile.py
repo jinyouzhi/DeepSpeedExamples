@@ -28,6 +28,7 @@ import deepspeed
 import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
 from deepspeed.checkpoint.affine_transfer import PlanBudget, plan_transfer
+from deepspeed.checkpoint.affine_transfer_calibration import calibrate_links
 from deepspeed.checkpoint.affine_transfer_executor import (StagingBudget, TransferEndpoints, TransferRequest,
                                                            execute_transfers, plan_digest)
 from deepspeed.checkpoint.autoep_affine import autoep_storage_affine_map, make_autoep_placement_descriptor
@@ -35,9 +36,6 @@ from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer
 
 EXPERT_PARAMS = ("w1", "w2", "w3")
 DTYPE = torch.bfloat16
-PEER = "peer"
-LOCAL = "local"
-CONCURRENT = "concurrent"
 
 
 def parse_args():
@@ -364,106 +362,6 @@ def time_execute(requests, endpoints, budget):
 
 
 # ---------------------------------------------------------------------------
-# Calibration: raw per-path times by message size, for an external cost model
-# ---------------------------------------------------------------------------
-
-
-def exchange(send, recv, to_process, from_process):
-    """Post one send and one receive in a single group call; either side may be None."""
-    ops = []
-    # Sends are posted before receives: oneCCL hangs on a group call that starts with a receive.
-    if to_process is not None:
-        ops.append(dist.P2POp(dist.isend, send, to_process))
-    if from_process is not None:
-        ops.append(dist.P2POp(dist.irecv, recv, from_process))
-    if ops:
-        for handle in dist.batch_isend_irecv(ops):
-            handle.wait()
-
-
-def timed_exchange(send, recv, to_process, from_process):
-    dist.barrier()
-    synchronize()
-    started = time.perf_counter()
-    exchange(send, recv, to_process, from_process)
-    synchronize()
-    return time.perf_counter() - started
-
-
-def calibrate(device, repeats=10, warmup=2):
-    """Record raw link times by message size, with no fit.
-
-    - peer: every ordered rank pair alone, so that links through different switches and
-      sockets are all sampled; the time of a sample is the slower of its two endpoints.
-    - concurrent: every rank sends to rank + shift and receives from rank - shift at once,
-      for every shift, so that links are sampled while they share switches and root ports.
-    - local: a device-local copy on every rank.
-    """
-    rank = dist.get_rank()
-    world = dist.get_world_size()
-    sizes = [1 << shift for shift in range(12, 27, 2)]
-    peer_times = {}
-    concurrent_times = {}
-    local_times = {}
-    for size in sizes:
-        numel = size // 2
-        send = torch.ones(numel, dtype=DTYPE, device=device)
-        recv = torch.empty(numel, dtype=DTYPE, device=device)
-        for source in range(world):
-            for target in range(world):
-                if source == target:
-                    continue
-                times = []
-                for repeat in range(warmup + repeats):
-                    to_process = target if rank == source else None
-                    from_process = source if rank == target else None
-                    seconds = timed_exchange(send, recv, to_process, from_process)
-                    if repeat >= warmup and rank in (source, target):
-                        times.append(seconds)
-                if times:
-                    peer_times[(size, source, target)] = times
-        for shift in range(1, world):
-            times = []
-            for repeat in range(warmup + repeats):
-                seconds = timed_exchange(send, recv, (rank + shift) % world, (rank - shift) % world)
-                if repeat >= warmup:
-                    times.append(seconds)
-            concurrent_times[(size, shift)] = times
-        times = []
-        for repeat in range(warmup + repeats):
-            synchronize()
-            started = time.perf_counter()
-            recv.copy_(send)
-            synchronize()
-            if repeat >= warmup:
-                times.append(time.perf_counter() - started)
-        local_times[size] = times
-
-    # Timings stay rank-local until here so that no collective runs inside a timed region.
-    gathered = all_ranks((peer_times, concurrent_times, local_times))
-    samples = {PEER: [], CONCURRENT: [], LOCAL: []}
-    for size in sizes:
-        for source in range(world):
-            for target in range(world):
-                if source == target:
-                    continue
-                source_times = gathered[source][0][(size, source, target)]
-                target_times = gathered[target][0][(size, source, target)]
-                samples[PEER].append({
-                    "bytes": size,
-                    "from_process": source,
-                    "to_process": target,
-                    "seconds": [max(pair) for pair in zip(source_times, target_times)],
-                })
-        for shift in range(1, world):
-            seconds_by_process = [gathered[process][1][(size, shift)] for process in range(world)]
-            samples[CONCURRENT].append({"bytes": size, "shift": shift, "seconds_by_process": seconds_by_process})
-        for process in range(world):
-            samples[LOCAL].append({"bytes": size, "process": process, "seconds": gathered[process][2][size]})
-    return samples
-
-
-# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -491,7 +389,6 @@ def manifest(args, world):
 
 def run_scenario(engine, scenario, policies, args, device):
     world = dist.get_world_size()
-    rank = dist.get_rank()
     items = expert_items(engine, scenario, world)
     endpoints = TransferEndpoints(source={location: location
                                           for location in range(world)},
@@ -567,7 +464,7 @@ def main():
     output = {"manifest": manifest(args, world)}
 
     if args.calibrate:
-        output["calibration"] = calibrate(device)
+        output["calibration"] = calibrate_links()
 
     output["runs"] = []
     policies = args.policies.split(",")
@@ -577,8 +474,13 @@ def main():
         if dist.get_rank() == 0:
             for record in records:
                 bits = record["bitwise"]
+                stats = record["executor_stats_by_rank"]
+                # The busiest sender and the longest round schedule, not total bytes, separate the selectors.
+                max_sent = max(rank_stats["sent_bytes"] for rank_stats in stats)
+                max_rounds = max(rank_stats["rounds"] for rank_stats in stats)
                 print(f"[{scenario:>10}/{record['policy']:<11}] "
                       f"mismatched={bits['mismatched_elements']} unwritten={bits['unwritten_elements']} "
+                      f"max_sent={max_sent / 2**20:.0f} MiB rounds={max_rounds} "
                       f"p50={record['execute'].get('p50', float('nan')) * 1e3:.2f} ms "
                       f"plan={record['plan_seconds'] * 1e3:.1f} ms",
                       flush=True)
